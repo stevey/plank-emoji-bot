@@ -1,0 +1,174 @@
+import { App, ExpressReceiver, LogLevel } from "@slack/bolt";
+import express from "express";
+import axios from "axios";
+import dayjs from "dayjs";
+import utc from "dayjs-plugin-utc";
+import timezone from "dayjs-plugin-timezone";
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const {
+  SLACK_SIGNING_SECRET,
+  SLACK_BOT_TOKEN,
+  NEW_EMOJI_CHANNEL,          // channel ID, e.g. C0123456789
+  AUDIT_LOGS_TOKEN            // optional (Enterprise Grid)
+} = process.env;
+
+if (!SLACK_SIGNING_SECRET || !SLACK_BOT_TOKEN || !NEW_EMOJI_CHANNEL) {
+  console.error("Missing required env vars.");
+  process.exit(1);
+}
+
+const receiver = new ExpressReceiver({
+  signingSecret: SLACK_SIGNING_SECRET,
+  endpoints: "/slack/events"
+});
+
+const app = new App({
+  receiver,
+  token: SLACK_BOT_TOKEN,
+  logLevel: LogLevel.INFO
+});
+
+// Util: try to resolve uploader using Audit Logs (Enterprise only)
+async function findUploaderForEmoji(name, occurredAtIso) {
+  if (!AUDIT_LOGS_TOKEN) return null;
+
+  // Look back a few minutes around the event time to find emoji_added
+  const occurred = dayjs(occurredAtIso).valueOf();
+  const oldest = Math.floor((occurred - 10 * 60 * 1000) / 1000);
+  const latest = Math.floor((occurred + 10 * 60 * 1000) / 1000);
+
+  const url = `https://api.slack.com/audit/v1/logs?action=emoji_added&oldest=${oldest}&latest=${latest}`;
+  try {
+    const res = await axios.get(url, {
+      headers: { Authorization: `Bearer ${AUDIT_LOGS_TOKEN}` }
+    });
+    const matches = (res.data?.entries || []).filter(
+      (e) => e?.entity?.type === "emoji" && e?.entity?.name === name
+    );
+    if (matches.length > 0) {
+      const actorId = matches[0]?.actor?.user_id;
+      if (!actorId) return null;
+
+      // Resolve username/display via users.info
+      const user = await axios.get("https://slack.com/api/users.info", {
+        headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
+        params: { user: actorId }
+      });
+      if (user.data?.ok) {
+        const u = user.data.user;
+        return u.profile?.display_name || u.real_name || `<@${actorId}>`;
+      }
+    }
+  } catch (err) {
+    console.warn("Audit logs lookup failed:", err?.response?.data || err.message);
+  }
+  return null;
+}
+
+// Listen for emoji changes
+app.event("emoji_changed", async ({ event, client, logger }) => {
+  try {
+    const subtype = event?.subtype; // "add" | "remove" | "rename"
+    const now = dayjs().tz("America/Toronto").format("YYYY-MM-DD HH:mm z");
+
+    if (subtype === "add") {
+      const name = event.name;
+      const value = event.value; // url or "alias:foo"
+      let imageUrl = value;
+
+      // If alias, resolve real URL via emoji.list
+      if (value?.startsWith?.("alias:")) {
+        const target = value.split(":")[1];
+        const list = await client.emoji.list();
+        if (list.ok && list.emoji && list.emoji[target]) {
+          imageUrl = list.emoji[target];
+        }
+      }
+
+      let addedBy = null;
+      if (AUDIT_LOGS_TOKEN) {
+        // Use the event time if present, else now
+        const occurredAtIso = event.event_ts ? dayjs.unix(+event.event_ts).toISOString() : dayjs().toISOString();
+        addedBy = await findUploaderForEmoji(name, occurredAtIso);
+      }
+
+      const blocks = [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              `:*New custom emoji added!*  :${name}:\n*Name:* \`:${name}:\`\n*When:* ${now}` +
+              (addedBy ? `\n*Added by:* ${addedBy}` : "")
+          }
+        }
+      ];
+
+      // If we have an image URL, show a preview
+      if (imageUrl && !imageUrl.startsWith("alias:")) {
+        blocks.push({
+          type: "image",
+          image_url: imageUrl,
+          alt_text: name
+        });
+      }
+
+      await client.chat.postMessage({
+        channel: NEW_EMOJI_CHANNEL,
+        text: `New emoji added :${name}:`,
+        blocks
+      });
+      return;
+    }
+
+    if (subtype === "rename") {
+      const { old_name, new_name } = event;
+      await client.chat.postMessage({
+        channel: NEW_EMOJI_CHANNEL,
+        text: `Emoji renamed :${new_name}:`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `:*Emoji renamed*\n\`:${old_name}:\` → \`:${new_name}:\`\n*When:* ${now}`
+            }
+          }
+        ]
+      });
+      return;
+    }
+
+    if (subtype === "remove") {
+      const removed = Array.isArray(event.names) ? event.names.join(", ") : event.name || "(unknown)";
+      await client.chat.postMessage({
+        channel: NEW_EMOJI_CHANNEL,
+        text: `Emoji removed`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `:*Emoji removed*\n\`${removed}\`\n*When:* ${now}`
+            }
+          }
+        ]
+      });
+      return;
+    }
+
+    logger.info("Unhandled emoji_changed subtype", subtype);
+  } catch (err) {
+    console.error("emoji_changed handler error:", err);
+  }
+});
+
+// Health check (App Platform pings root)
+receiver.router.get("/", (_req, res) => res.status(200).send("Plank-Emoji-Bot OK"));
+
+(async () => {
+  await app.start(process.env.PORT || 3000);
+  console.log("Plank-Emoji-Bot is running");
+})();
